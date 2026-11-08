@@ -73,7 +73,17 @@ async function handleApi(request, env) {
   if (url.pathname === "/api/state" && request.method === "GET") {
     try {
       const state = await getState(env);
-      return json({ ok: true, state });
+      return json({ ok: true, state: { settings: state.settings, cats: state.cats, products: state.products } });
+    } catch (error) {
+      return json({ ok: false, error: "state_read_failed" }, 500);
+    }
+  }
+
+  if (url.pathname === "/api/admin/state" && request.method === "GET") {
+    const session = await requireAdmin(request, env);
+    if (!session) return json({ ok: false, error: "unauthorized" }, 401);
+    try {
+      return json({ ok: true, state: await getState(env) });
     } catch (error) {
       return json({ ok: false, error: "state_read_failed" }, 500);
     }
