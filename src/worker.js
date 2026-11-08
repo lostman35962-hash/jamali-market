@@ -1,4 +1,4 @@
-const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
+const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,PUT,OPTIONS", "access-control-allow-headers": "content-type,authorization" };
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: JSON_HEADERS });
@@ -59,7 +59,7 @@ async function getState(env) {
 }
 async function handleApi(request, env) {
   const url = new URL(request.url);
-  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: { "access-control-allow-origin": url.origin, "access-control-allow-methods": "GET,POST,PUT,OPTIONS", "access-control-allow-headers": "content-type,authorization" } });
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: JSON_HEADERS });
 
   if (url.pathname === "/api/health" && request.method === "GET") {
     try {
@@ -121,6 +121,59 @@ async function handleApi(request, env) {
       return json({ ok: true, token, expiresIn: 604800 });
     } catch (error) {
       return json({ ok: false, error: "login_failed" }, 500);
+    }
+  }
+
+  if (url.pathname === "/api/orders" && request.method === "POST") {
+    try {
+      const body = await request.json();
+      const { name, phone, address, date, time, note = "", paymentMethod = "cash", items = [], checkDate = "", checkImage = "" } = body;
+      if (!name || !/^09\\d{9}$/.test(String(phone || "")) || !address || !date || !time || !Array.isArray(items) || !items.length) return json({ ok: false, error: "invalid_order_details" }, 400);
+      if (paymentMethod === "online") return json({ ok: false, error: "online_payment_not_configured" }, 409);
+      if (!["cash", "check", "installment"].includes(paymentMethod)) return json({ ok: false, error: "invalid_payment_method" }, 400);
+      if (paymentMethod === "check" && (!checkDate || !checkImage)) return json({ ok: false, error: "check_details_required" }, 400);
+      const state = await getState(env);
+      const normalized = [];
+      let subtotal = 0, qtyTotal = 0;
+      for (const item of items) {
+        const product = state.products.find(p => p.id === String(item.id));
+        const qty = Math.floor(Number(item.qty));
+        if (!product || !Number.isFinite(qty) || qty < 1 || qty > Number(product.stock || 0)) return json({ ok: false, error: "stock_changed", productId: item.id }, 409);
+        normalized.push({ id: product.id, name: product.name, price: Number(product.price), qty, image: product.images?.[0] || "" });
+        subtotal += Number(product.price) * qty;
+        qtyTotal += qty;
+      }
+      if (qtyTotal < Number(state.settings.minOrderQty || 3)) return json({ ok: false, error: "minimum_order_quantity" }, 400);
+      const bulk = qtyTotal >= Number(state.settings.bulkMinQty || 3) ? Math.round(subtotal * Number(state.settings.bulkDiscount || 0) / 100) : 0;
+      const cashDiscount = paymentMethod === "cash" ? Math.round((subtotal - bulk) * Number(state.settings.cashDiscount || 0) / 100) : 0;
+      const total = Math.round(subtotal - bulk - cashDiscount + Number(state.settings.deliveryFee || 0));
+      let customer = state.customers.find(x => x.phone === phone);
+      if (paymentMethod === "installment" && !customer?.installment) return json({ ok: false, error: "installment_not_authorized" }, 403);
+      if (!customer) { customer = { id: "c" + Date.now(), name, phone, address, installment: false }; state.customers.push(customer); }
+      else { customer.name = name; customer.address = address; }
+      for (const item of normalized) state.products.find(p => p.id === item.id).stock -= item.qty;
+      const order = { id: "JM-" + crypto.randomUUID().slice(0, 8).toUpperCase(), name, phone, address, date, time, note, pay: paymentMethod, items: normalized, subtotal, bulk, cash: cashDiscount, delivery: Number(state.settings.deliveryFee || 0), total, status: "در انتظار بررسی", created: new Date().toISOString(), checkDate, checkImage, customerId: customer.id };
+      state.orders.push(order);
+      await env.DB.prepare("INSERT INTO app_state (id, state_json, updated_at) VALUES (1, ?, CURRENT_TIMESTAMP) ON CONFLICT(id) DO UPDATE SET state_json = excluded.state_json, updated_at = CURRENT_TIMESTAMP").bind(JSON.stringify(state)).run();
+      return json({ ok: true, order: { id: order.id, total: order.total, status: order.status } }, 201);
+    } catch (error) {
+      return json({ ok: false, error: "order_creation_failed" }, 500);
+    }
+  }
+
+  if (url.pathname === "/api/admin/credentials" && request.method === "PUT") {
+    const session = await requireAdmin(request, env);
+    if (!session) return json({ ok: false, error: "unauthorized" }, 401);
+    try {
+      const body = await request.json();
+      const username = String(body.username || "").trim();
+      const password = String(body.password || "");
+      if (username.length < 3 || password.length < 10) return json({ ok: false, error: "username_min_3_password_min_10" }, 400);
+      const encoded = await passwordHash(password);
+      await env.DB.prepare("UPDATE admins SET username = ?, password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(username, encoded.salt + ":" + encoded.hash, session.admin_id).run();
+      return json({ ok: true });
+    } catch (error) {
+      return json({ ok: false, error: "credentials_update_failed" }, 500);
     }
   }
 
